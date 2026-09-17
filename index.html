@@ -1,0 +1,686 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="robots" content="noindex, nofollow">
+<title>領収書</title>
+<style>
+  :root {
+    --ink: #17171c;
+    --sub: #6b6b74;
+    --line: #d9d9e0;
+    --bg: #f2f2f6;
+    --card: #ffffff;
+    --warn: #c2410c;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: 20px 16px 40px;
+    background: var(--bg);
+    color: var(--ink);
+    font-family: -apple-system, BlinkMacSystemFont, "Hiragino Sans", "Noto Sans JP", "Yu Gothic", sans-serif;
+    -webkit-text-size-adjust: 100%;
+  }
+  main { max-width: 560px; margin: 0 auto; }
+  h1 { font-size: 18px; margin: 0 0 16px; text-align: center; letter-spacing: 0.08em; }
+  .card {
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: 14px;
+    padding: 16px;
+  }
+  .card canvas { width: 100%; height: auto; display: block; border-radius: 6px; background: #fff; }
+  .note {
+    margin-top: 14px;
+    font-size: 13px;
+    color: var(--sub);
+    line-height: 1.7;
+    text-align: center;
+  }
+  .status {
+    margin-top: 24px;
+    text-align: center;
+    font-size: 15px;
+    line-height: 1.8;
+    color: var(--sub);
+  }
+  .status.error { color: var(--warn); }
+  .status strong { display: block; font-size: 16px; color: var(--ink); margin-bottom: 6px; }
+  .spinner {
+    width: 26px; height: 26px; margin: 0 auto 12px;
+    border: 3px solid var(--line);
+    border-top-color: var(--sub);
+    border-radius: 50%;
+    animation: spin 0.9s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  [hidden] { display: none !important; }
+  .actions {
+    margin-top: 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+  .btn {
+    display: block;
+    width: 100%;
+    padding: 14px 16px;
+    font-size: 16px;
+    font-weight: 600;
+    line-height: 1.3;
+    border-radius: 10px;
+    border: 1px solid var(--line);
+    background: var(--card);
+    color: var(--ink);
+    cursor: pointer;
+    -webkit-tap-highlight-color: transparent;
+  }
+  .btn:active { background: var(--bg); }
+  #saveImageBtn { background: var(--ink); color: #fff; border-color: var(--ink); }
+  .fallback {
+    margin: -2px 0 0;
+    font-size: 13px;
+    color: var(--warn);
+    line-height: 1.6;
+    text-align: center;
+  }
+  .hint {
+    margin: -2px 0 0;
+    font-size: 12px;
+    color: var(--sub);
+    line-height: 1.6;
+    text-align: center;
+  }
+  @media print {
+    body { margin: 0; padding: 0; background: #fff; }
+    main { max-width: none; margin: 0; }
+    h1, .actions, .note, #loading, #error { display: none !important; }
+    .card { border: none; border-radius: 0; padding: 0; }
+    .card canvas { width: 100%; height: auto; }
+    @page { size: A4 landscape; margin: 0; }
+  }
+</style>
+</head>
+<body>
+<main>
+  <h1>領収書</h1>
+
+  <div id="loading" class="status">
+    <div class="spinner"></div>
+    読み込んでいます…
+  </div>
+
+  <div id="viewer" hidden>
+    <div class="card">
+      <canvas id="receipt" width="1500" height="1020" aria-label="領収書"></canvas>
+    </div>
+    <div class="actions" id="actions">
+      <button type="button" id="saveImageBtn" class="btn">画像を保存</button>
+      <p class="fallback" id="saveImageFallback" hidden>このブラウザでは画像を保存できません。スクリーンショットをご利用ください。</p>
+      <button type="button" id="savePdfBtn" class="btn">PDFで保存</button>
+      <p class="hint">プリント画面から"PDFとして保存"できます</p>
+    </div>
+    <p class="note">このQRに領収書の内容が直接入っています。ネットに接続しなくても表示できます。</p>
+  </div>
+
+  <div id="error" class="status error" hidden>
+    <strong id="errorTitle">領収書のデータが読み取れません</strong>
+    <span id="errorDetail">発行元からもう一度QRコードを見せてもらってください。</span>
+  </div>
+</main>
+
+<script>
+(() => {
+  "use strict";
+
+  const el = (id) => document.getElementById(id);
+
+  // ============================================================
+  // エラー表示
+  // ============================================================
+
+  function showError(title, detail) {
+    el("loading").hidden = true;
+    el("viewer").hidden = true;
+    if (title) el("errorTitle").textContent = title;
+    if (detail) el("errorDetail").textContent = detail;
+    el("error").hidden = false;
+  }
+
+  // ============================================================
+  // フラグメントのデコード
+  // アプリ側(QRPayload.swift)と対になる処理。
+  // 1. = base64url(deflate-raw圧縮), 0. = base64url(無圧縮)
+  // ============================================================
+
+  function base64UrlToBytes(base64url) {
+    let base64 = base64url.replace(/-/g, "+").replace(/_/g, "/");
+    const pad = base64.length % 4;
+    if (pad) base64 += "=".repeat(4 - pad);
+    const binary = atob(base64);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    return bytes;
+  }
+
+  async function inflateRaw(bytes) {
+    if (!("DecompressionStream" in window)) return null;
+    const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream("deflate-raw"));
+    const buffer = await new Response(stream).arrayBuffer();
+    return new Uint8Array(buffer);
+  }
+
+  /**
+   * URLフラグメント(#より後ろ、"1."/"0."前置込み)を領収書データのオブジェクトに戻す。
+   * 壊れている・非対応の場合は null を返さず例外を投げて呼び出し側で文言を出し分ける。
+   */
+  async function decodeFragment(fragment) {
+    if (!fragment || fragment.length < 3) return null;
+    const prefix = fragment.slice(0, 2);
+    const body = fragment.slice(2);
+    if (prefix !== "1." && prefix !== "0.") return null;
+
+    const raw = base64UrlToBytes(body);
+    let jsonBytes;
+    if (prefix === "1.") {
+      jsonBytes = await inflateRaw(raw);
+      if (!jsonBytes) throw new Error("unsupported-compression");
+    } else {
+      jsonBytes = raw;
+    }
+    const text = new TextDecoder("utf-8").decode(jsonBytes);
+    return JSON.parse(text);
+  }
+
+  /** 復元したJSONの最低限の形を整える(壊れたデータで描画が落ちないように)。*/
+  function normalizePayload(raw) {
+    if (!raw || typeof raw !== "object") return null;
+    if (typeof raw.n !== "string" || !raw.n) return null;
+    if (typeof raw.t !== "number") return null;
+    if (!Array.isArray(raw.i) || raw.i.length === 0) return null;
+    const issuer = raw.is && typeof raw.is === "object" ? raw.is : {};
+    return {
+      no: raw.n,
+      dateRaw: typeof raw.d === "string" ? raw.d : "",
+      payee: typeof raw.p === "string" ? raw.p : "",
+      total: raw.t,
+      items: raw.i.map((row) => ({
+        name: String(row[0] ?? ""),
+        amount: Number(row[1]) || 0,
+        qty: Number(row[2]) || 0,
+        taxRate: row[3] == null ? null : Number(row[3])
+      })),
+      tax: Array.isArray(raw.x)
+        ? raw.x.map((row) => ({ rate: Number(row[0]), target: Number(row[1]), tax: Number(row[2]) }))
+        : [],
+      issuer: {
+        name: typeof issuer.n === "string" ? issuer.n : "",
+        address: typeof issuer.a === "string" ? issuer.a : "",
+        personName: typeof issuer.p === "string" ? issuer.p : "",
+        registrationNumber: typeof issuer.r === "string" ? issuer.r : ""
+      }
+    };
+  }
+
+  // ============================================================
+  // 表示用フォーマット(NMReceipt/Models.swift の JP enum と対応)
+  // ============================================================
+
+  function yen(amount) {
+    const rounded = Math.round(amount);
+    return "¥" + rounded.toLocaleString("ja-JP");
+  }
+
+  /** "2026-08-24T10:03" -> "2026年8月24日"(アプリの JP.issueDate と同じ体裁) */
+  function formatIssueDate(dateRaw) {
+    const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(dateRaw || "");
+    if (!m) return "";
+    const y = parseInt(m[1], 10);
+    const mo = parseInt(m[2], 10);
+    const da = parseInt(m[3], 10);
+    return `${y}年${mo}月${da}日`;
+  }
+
+  /** 宛先ボックスに出す文字列(空なら空のまま = 宛名線のみ)。*/
+  function payeeBoxText(payee) {
+    return (payee || "").trim();
+  }
+
+  /** 「様」を別途出すかどうか。「上様」は敬称を含むため出さない(ReceiptImageView と同じルール)。 */
+  function showSamaSuffix(payee) {
+    return payeeBoxText(payee) !== "上様";
+  }
+
+  /** 税率別内訳の1行「(8%対象 ¥3,000　内消費税 ¥222 ※軽減税率対象)」 */
+  function taxLineText(entry) {
+    const reduced = entry.rate === 8 ? " ※軽減税率対象" : "";
+    return `(${entry.rate}%対象 ${yen(entry.target)}　内消費税 ${yen(entry.tax)}${reduced})`;
+  }
+
+  // ============================================================
+  // 領収書の描画(Canvas 2D)
+  // NMReceipt/ReceiptImageView.swift のレイアウトを 500×340pt の
+  // 論理座標系のまま踏襲する(canvasは1500×1020pxだが scale(3,3) して
+  // 以降の描画はすべて pt 単位で書けるようにする)。
+  // ============================================================
+
+  const PT_WIDTH = 500;
+  const PT_HEIGHT = 340;
+  const PAD_X = 30;
+  const PAD_Y = 20;
+
+  const INK = "#17171c";   // rgb(0.09,0.09,0.11) 相当
+  const RULE = "#595961";  // rgb(0.35,0.35,0.38) 相当
+  const SEAL = "#D0342C";
+
+  const SERIF = '"Hiragino Mincho ProN", "Yu Mincho", serif';
+
+  function fontStr(size, bold) {
+    return `${bold ? "bold " : ""}${size}px ${SERIF}`;
+  }
+
+  /** SwiftUI Text のおおよその行高。厳密な行送りではなく見た目合わせの近似値。 */
+  function lineHeight(size) {
+    return size * 1.2;
+  }
+
+  function setLetterSpacing(ctx, px) {
+    try { ctx.letterSpacing = px + "px"; } catch (e) { /* 非対応ブラウザは無視 */ }
+  }
+
+  function drawText(ctx, text, x, y, size, opts = {}) {
+    ctx.font = fontStr(size, opts.bold);
+    ctx.fillStyle = opts.color || INK;
+    ctx.textAlign = opts.align || "left";
+    ctx.textBaseline = "top";
+    if (opts.letterSpacing) setLetterSpacing(ctx, opts.letterSpacing);
+    ctx.fillText(text, x, y);
+    if (opts.letterSpacing) setLetterSpacing(ctx, 0);
+  }
+
+  /** 1行に収まらないときに末尾を「…」で詰める(lineLimit(1)の代わり)。 */
+  function fitOneLine(ctx, text, size, maxWidth, bold) {
+    ctx.font = fontStr(size, bold);
+    if (ctx.measureText(text).width <= maxWidth) return text;
+    let t = text;
+    while (t.length > 1 && ctx.measureText(t + "…").width > maxWidth) {
+      t = t.slice(0, -1);
+    }
+    return t + "…";
+  }
+
+  /** 日本語には単語区切りが無いので1文字ずつ折り返す(lineLimit(2)の代わり)。 */
+  function wrapLines(ctx, text, size, maxWidth, maxLines) {
+    ctx.font = fontStr(size, false);
+    const chars = Array.from(text || "");
+    const lines = [];
+    let line = "";
+    for (const ch of chars) {
+      const test = line + ch;
+      if (line && ctx.measureText(test).width > maxWidth) {
+        lines.push(line);
+        line = ch;
+        if (lines.length === maxLines) { line = ""; break; }
+      } else {
+        line = test;
+      }
+    }
+    if (lines.length < maxLines) {
+      if (line) lines.push(line);
+    } else if (line) {
+      let last = lines[maxLines - 1];
+      while (last.length > 0 && ctx.measureText(last + "…").width > maxWidth) {
+        last = last.slice(0, -1);
+      }
+      lines[maxLines - 1] = last + "…";
+    }
+    return lines.length ? lines : [""];
+  }
+
+  /** minimumScaleFactor(0.5) 相当: 収まらなければ最大50%まで縮める。 */
+  function drawShrinkableText(ctx, text, x, y, size, maxWidth, opts = {}) {
+    ctx.font = fontStr(size, opts.bold);
+    const width = ctx.measureText(text).width;
+    const scale = width > maxWidth ? Math.max(0.5, maxWidth / width) : 1;
+    drawText(ctx, text, x, y, size * scale, opts);
+    return size * scale;
+  }
+
+  function drawRoundRect(ctx, x, y, w, h, r) {
+    ctx.beginPath();
+    ctx.moveTo(x + r, y);
+    ctx.arcTo(x + w, y, x + w, y + h, r);
+    ctx.arcTo(x + w, y + h, x, y + h, r);
+    ctx.arcTo(x, y + h, x, y, r);
+    ctx.arcTo(x, y, x + w, y, r);
+    ctx.closePath();
+  }
+
+  /** 明細1行の表示ラベル。丸め行(qty===0)はそのまま、通常行は「品名 ×n」。 */
+  function itemLineLabel(item) {
+    return item.qty === 0 ? item.name : `${item.name} ×${item.qty}`;
+  }
+
+  function drawSeal(ctx, cx, cy, size, text) {
+    const r1 = size / 2;
+    const r2 = r1 - size * 0.11;
+    ctx.strokeStyle = SEAL;
+    ctx.lineWidth = size * 0.055;
+    ctx.beginPath();
+    ctx.arc(cx, cy, r1 - ctx.lineWidth / 2, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.lineWidth = size * 0.03;
+    ctx.beginPath();
+    ctx.arc(cx, cy, r2 - ctx.lineWidth / 2, 0, Math.PI * 2);
+    ctx.stroke();
+
+    const chars = Array.from(text).slice(0, 2);
+    const charSize = size * 0.33;
+    const gap = size * 0.01;
+    const totalH = chars.length * charSize * 1.05 + (chars.length - 1) * gap;
+    let cyText = cy - totalH / 2;
+    ctx.textAlign = "center";
+    ctx.textBaseline = "top";
+    ctx.font = fontStr(charSize, true);
+    ctx.fillStyle = SEAL;
+    for (const ch of chars) {
+      ctx.fillText(ch, cx, cyText);
+      cyText += charSize * 1.05 + gap;
+    }
+  }
+
+  function footerLines(ctx, issuer) {
+    const addressLines = wrapLines(ctx, issuer.address, 10, 220, 2);
+    const lines = [{ text: issuer.name, size: 14, bold: true }];
+    addressLines.forEach((l) => lines.push({ text: l, size: 10 }));
+    lines.push({ text: issuer.personName, size: 12 });
+    if (issuer.registrationNumber) {
+      lines.push({ text: `登録番号 ${issuer.registrationNumber}`, size: 9, color: RULE });
+    }
+    return lines;
+  }
+
+  function footerHeight(lines) {
+    const textH = lines.reduce((sum, l) => sum + lineHeight(l.size), 0) + 2 * Math.max(0, lines.length - 1);
+    return Math.max(textH, 58);
+  }
+
+  // ------------------------------------------------------------
+  // 明細ブロック(但し書き〜税額行)のモデル化。
+  // 発行者ブロック(footer)を先に確保したあとの残り空間に収まるよう、
+  // 「行間を詰める→明細を畳む→フォントを縮小(下限9pt)」の順で段階的に圧縮する。
+  // ReceiptImageView.swift の compressionStages と同じ考え方。
+  // ------------------------------------------------------------
+
+  /** 6件以上あるときは先頭(limit-1)件 + 「ほか n点 ¥x」にまとめる(Sale.swift の detailLines と同じ丸め方)。 */
+  function collapseItems(items, limit) {
+    if (items.length <= limit) {
+      return items.map((it) => ({ name: itemLineLabel(it), amount: it.amount }));
+    }
+    const head = items.slice(0, Math.max(1, limit - 1));
+    const rest = items.slice(head.length);
+    const restQty = rest.reduce((s, it) => s + it.qty, 0);
+    const restAmount = rest.reduce((s, it) => s + it.amount, 0);
+    return head
+      .map((it) => ({ name: itemLineLabel(it), amount: it.amount }))
+      .concat([{ name: `ほか ${restQty}点`, amount: restAmount }]);
+  }
+
+  /** 但し書き〜税額行の行モデルを組み立てる(実際の描画はせず、高さ計算にも使う)。 */
+  function buildProvisoModel(doc, isMulti, itemLimit, itemFont) {
+    if (!isMulti) {
+      const item = doc.items[0];
+      const lines = [
+        { kind: "text", text: `但し ${item.name} として`, size: 14, gapBefore: 0 },
+        { kind: "text", text: "上記正に領収いたしました", size: 13, gapBefore: 5 }
+      ];
+      doc.tax.forEach((entry) => {
+        lines.push({ kind: "text", text: taxLineText(entry), size: 10, color: RULE, gapBefore: 5 });
+      });
+      return lines;
+    }
+    const rows = collapseItems(doc.items, itemLimit);
+    const lines = [{ kind: "text", text: "但し 下記のとおり", size: 11, gapBefore: 0 }];
+    rows.forEach((row) => lines.push({ kind: "itemRow", row, size: itemFont, gapBefore: 1 }));
+    lines.push({ kind: "text", text: "上記正に領収いたしました", size: 11, gapBefore: 2 });
+    doc.tax.forEach((entry) => {
+      lines.push({ kind: "text", text: taxLineText(entry), size: 9, color: RULE, gapBefore: 2 });
+    });
+    return lines;
+  }
+
+  /** 行モデルの合計高さ(pt)。フォントの実測はせず lineHeight() の近似式だけで決まる。 */
+  function provisoHeight(lines) {
+    return lines.reduce((sum, l) => sum + l.gapBefore + lineHeight(l.size), 0);
+  }
+
+  /** 行モデルを実際に描画し、末尾のy座標を返す。 */
+  function drawProvisoModel(ctx, lines, left, startY) {
+    const detailWidth = 300;
+    let y = startY;
+    for (const l of lines) {
+      y += l.gapBefore;
+      if (l.kind === "text") {
+        drawText(ctx, l.text, left, y, l.size, { color: l.color });
+      } else {
+        const amountStr = yen(l.row.amount);
+        ctx.font = fontStr(l.size, false);
+        const amountW = ctx.measureText(amountStr).width;
+        const label = fitOneLine(ctx, l.row.name, l.size, detailWidth - 8 - amountW, false);
+        drawText(ctx, label, left, y, l.size, {});
+        drawText(ctx, amountStr, left + detailWidth, y, l.size, { align: "right" });
+      }
+      y += lineHeight(l.size);
+    }
+    return y;
+  }
+
+  /** 圧縮段階の一覧。先頭ほど非圧縮、末尾が最も詰めた状態。最初に収まった段階を採用する。 */
+  function compressionStages(isMulti) {
+    if (!isMulti) {
+      return [
+        { gapLevel: 0, itemLimit: 1, itemFont: 14 },
+        { gapLevel: 1, itemLimit: 1, itemFont: 14 },
+        { gapLevel: 2, itemLimit: 1, itemFont: 14 }
+      ];
+    }
+    return [
+      { gapLevel: 0, itemLimit: 5, itemFont: 10 },
+      { gapLevel: 1, itemLimit: 5, itemFont: 10 },
+      { gapLevel: 2, itemLimit: 5, itemFont: 10 },
+      { gapLevel: 2, itemLimit: 4, itemFont: 10 },
+      { gapLevel: 2, itemLimit: 3, itemFont: 10 },
+      { gapLevel: 2, itemLimit: 2, itemFont: 10 },
+      { gapLevel: 2, itemLimit: 1, itemFont: 10 },
+      { gapLevel: 2, itemLimit: 1, itemFont: 9 }
+    ];
+  }
+
+  function gapsForLevel(level, isMulti) {
+    const table = isMulti ? [[8, 6, 5], [5, 4, 3], [3, 2, 2]] : [[12, 10, 8], [8, 6, 5], [5, 4, 3]];
+    return table[Math.min(level, table.length - 1)];
+  }
+
+  function drawReceipt(canvas, doc) {
+    const ctx = canvas.getContext("2d");
+    ctx.setTransform(3, 0, 0, 3, 0, 0);
+    ctx.clearRect(0, 0, PT_WIDTH, PT_HEIGHT);
+    ctx.fillStyle = "#ffffff";
+    ctx.fillRect(0, 0, PT_WIDTH, PT_HEIGHT);
+
+    const left = PAD_X;
+    const right = PT_WIDTH - PAD_X;
+    const contentWidth = right - left;
+    const isMulti = doc.items.length > 1;
+
+    // ---- footer(発行者ブロック + 朱印)を先に確保する。フレーム下端に固定し、
+    //      本文がどれだけ伸びても footer 側には一切譲らない(v8-1)。
+    const footerLinesArr = footerLines(ctx, doc.issuer);
+    const footerH = footerHeight(footerLinesArr);
+    const footerBottom = PT_HEIGHT - PAD_Y;
+    const footerTop = footerBottom - footerH;
+
+    // 本文側の固定高さ(見出し・宛先行・金額枠は文言に関わらず高さが変わらない)
+    const headerH = Math.max(lineHeight(30) + 3 + 1.5, lineHeight(11) * 2 + 4);
+    const payeeRowH = Math.max(lineHeight(19) + 3 + 1, lineHeight(15) + 3);
+    const boxPadV = 8;
+    const amountBoxH = Math.max(lineHeight(13), lineHeight(30)) + boxPadV * 2;
+
+    // 本文が footerTop に収まる圧縮段階を探す。見つからなければ最も詰めた段階を使う(はみ出しは残るが最小化)。
+    const stages = compressionStages(isMulti);
+    let gaps = gapsForLevel(stages[stages.length - 1].gapLevel, isMulti);
+    let provisoModel = buildProvisoModel(doc, isMulti, stages[stages.length - 1].itemLimit, stages[stages.length - 1].itemFont);
+    for (const stage of stages) {
+      const candidateGaps = gapsForLevel(stage.gapLevel, isMulti);
+      const candidateModel = buildProvisoModel(doc, isMulti, stage.itemLimit, stage.itemFont);
+      const bodyTop = PAD_Y + headerH + candidateGaps[0] + payeeRowH + candidateGaps[1] + amountBoxH + candidateGaps[2];
+      const bodyBottom = bodyTop + provisoHeight(candidateModel);
+      gaps = candidateGaps;
+      provisoModel = candidateModel;
+      if (bodyBottom <= footerTop) break;
+    }
+
+    let y = PAD_Y;
+
+    // ---- header ----
+    drawText(ctx, "領収書", left, y, 30, { bold: true, letterSpacing: 6 });
+    ctx.fillStyle = INK;
+    ctx.fillRect(left, y + lineHeight(30) + 3, 108, 1.5);
+
+    const dateText = doc.dateRaw ? `発行日 ${formatIssueDate(doc.dateRaw)}` : "";
+    drawText(ctx, `No. ${doc.no}`, right, y, 11, { align: "right", color: RULE });
+    if (dateText) {
+      drawText(ctx, dateText, right, y + lineHeight(11) + 4, 11, { align: "right", color: RULE });
+    }
+    y += headerH + gaps[0];
+
+    // ---- payeeRow ----
+    const payeeBoxWidth = 300;
+    const payeeText = payeeBoxText(doc.payee);
+    const fittedPayee = fitOneLine(ctx, payeeText, 19, payeeBoxWidth, false);
+    drawText(ctx, fittedPayee, left, y, 19, {});
+    ctx.fillStyle = INK;
+    ctx.fillRect(left, y + lineHeight(19) + 3, payeeBoxWidth, 1);
+    if (showSamaSuffix(doc.payee)) {
+      const samaY = y + payeeRowH - 3 - lineHeight(15);
+      drawText(ctx, "様", left + payeeBoxWidth + 6, samaY, 15, {});
+    }
+    y += payeeRowH + gaps[1];
+
+    // ---- amountBox ----
+    const boxPadH = 16;
+    ctx.strokeStyle = INK;
+    ctx.lineWidth = 1.2;
+    drawRoundRect(ctx, left, y, contentWidth, amountBoxH, 3);
+    ctx.stroke();
+    const contentY = y + boxPadV;
+    drawText(ctx, "金額", left + boxPadH, contentY, 13, { letterSpacing: 2 });
+    const labelWidth = (() => {
+      ctx.font = fontStr(13, false);
+      return ctx.measureText("金額").width + 2 * 2; // kerning分の余白を少し足す
+    })();
+    const amountText = `${yen(doc.total)} -`;
+    const amountX = left + boxPadH + labelWidth + 14;
+    const amountMaxWidth = right - boxPadH - amountX;
+    drawShrinkableText(ctx, amountText, amountX, contentY, 30, amountMaxWidth, { bold: true });
+    y += amountBoxH + gaps[2];
+
+    // ---- provisoBlock(圧縮済みモデルを描画) ----
+    drawProvisoModel(ctx, provisoModel, left, y);
+
+    // ---- footer(発行者ブロック + 朱印。フレーム下端に固定) ----
+    const sealSize = 58;
+    const sealCx = right - sealSize / 2;
+    const sealCy = footerTop + Math.max(footerH, sealSize) / 2;
+    drawSeal(ctx, sealCx, sealCy, sealSize, doc.issuer.personName ? doc.issuer.personName.trim().slice(0, 2) || "領収" : "領収");
+
+    const issuerRight = right - sealSize - 12;
+    const issuerLeft = issuerRight - 220;
+    const issuerTextH = footerLinesArr.reduce((sum, l) => sum + lineHeight(l.size), 0) + 2 * Math.max(0, footerLinesArr.length - 1);
+    let ly = footerTop + Math.max(0, (footerH - issuerTextH));
+    for (const l of footerLinesArr) {
+      drawText(ctx, l.text, issuerLeft, ly, l.size, { bold: !!l.bold, color: l.color });
+      ly += lineHeight(l.size) + 2;
+    }
+  }
+
+  // ============================================================
+  // 画面配線
+  // ============================================================
+
+  function saveImage(canvas, no) {
+    el("saveImageFallback").hidden = true;
+    if (!canvas.toBlob) {
+      el("saveImageFallback").hidden = false;
+      return;
+    }
+    canvas.toBlob((blob) => {
+      if (!blob) {
+        el("saveImageFallback").hidden = false;
+        return;
+      }
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `領収書_No.${no}.png`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 10000);
+    }, "image/png");
+  }
+
+  function savePdf() {
+    window.print();
+  }
+
+  async function main() {
+    const fragment = window.location.hash.slice(1);
+    if (!fragment) {
+      showError("領収書のデータが読み取れません", "発行元からもう一度QRコードを見せてもらってください。");
+      return;
+    }
+
+    let raw;
+    try {
+      raw = await decodeFragment(fragment);
+    } catch (e) {
+      showError(
+        "領収書のデータが読み取れません",
+        "このブラウザは圧縮データの展開に対応していません。別のブラウザ(Chrome / Safari 最新版)でお試しください。"
+      );
+      return;
+    }
+
+    const doc = normalizePayload(raw);
+    if (!doc) {
+      showError("領収書のデータが読み取れません", "発行元からもう一度QRコードを見せてもらってください。");
+      return;
+    }
+
+    const canvas = el("receipt");
+    try {
+      drawReceipt(canvas, doc);
+    } catch (e) {
+      console.error(e);
+      showError("領収書の描画に失敗しました", "発行元からもう一度QRコードを見せてもらってください。");
+      return;
+    }
+
+    el("loading").hidden = true;
+    el("viewer").hidden = false;
+    el("saveImageBtn").addEventListener("click", () => saveImage(canvas, doc.no));
+    el("savePdfBtn").addEventListener("click", savePdf);
+  }
+
+  // 別の領収書URLを同じタブで開いたとき(フラグメントだけの変化)も描き直す。
+  // リスナーの二重登録を避けるため、再実行ではなく読み込み直す。
+  window.addEventListener("hashchange", () => window.location.reload());
+
+  main();
+})();
+</script>
+</body>
+</html>
