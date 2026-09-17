@@ -175,7 +175,16 @@
   /**
    * URLフラグメント(#より後ろ、"1."/"0."前置込み)を領収書データのオブジェクトに戻す。
    * 壊れている・非対応の場合は null を返さず例外を投げて呼び出し側で文言を出し分ける。
+   *
+   * v8-9: フラグメントは客のURL由来で改変できる。展開後サイズが異常に大きいものは
+   * JSON.parse に通す前に弾く(巨大な文字列のパース自体を避ける)。
    */
+  const PAYLOAD_LIMITS = {
+    maxDecodedBytes: 64 * 1024,
+    maxItems: 50,
+    maxStringLength: 200
+  };
+
   async function decodeFragment(fragment) {
     if (!fragment || fragment.length < 3) return null;
     const prefix = fragment.slice(0, 2);
@@ -190,36 +199,106 @@
     } else {
       jsonBytes = raw;
     }
+    if (jsonBytes.length > PAYLOAD_LIMITS.maxDecodedBytes) {
+      throw new PayloadValidationError("too-large");
+    }
     const text = new TextDecoder("utf-8").decode(jsonBytes);
     return JSON.parse(text);
   }
 
-  /** 復元したJSONの最低限の形を整える(壊れたデータで描画が落ちないように)。*/
+  /** 型不一致・上限超過・辻褄不一致など、`normalizePayload` が構造を信用できないと判断した理由。 */
+  class PayloadValidationError extends Error {
+    constructor(reason) {
+      super(`invalid receipt payload: ${reason}`);
+      this.reason = reason;
+    }
+  }
+
+  function isFiniteInteger(v) {
+    return typeof v === "number" && Number.isFinite(v) && Number.isInteger(v);
+  }
+
+  function isNonNegativeInteger(v) {
+    return isFiniteInteger(v) && v >= 0;
+  }
+
+  function isPlainObject(v) {
+    return !!v && typeof v === "object" && !Array.isArray(v);
+  }
+
+  function requireString(v, allowEmpty) {
+    if (typeof v !== "string") throw new PayloadValidationError("type-mismatch");
+    if (v.length > PAYLOAD_LIMITS.maxStringLength) throw new PayloadValidationError("too-large");
+    if (!allowEmpty && !v) throw new PayloadValidationError("type-mismatch");
+    return v;
+  }
+
+  /** 型不一致・任意欄が欠けている場合の既定値付き文字列(無ければ空文字)。 */
+  function optionalString(v) {
+    if (v === undefined || v === null) return "";
+    return requireString(v, true);
+  }
+
+  /**
+   * 復元したJSONを検証込みで整形する。フラグメントは客のURL由来で改変可能なので、
+   * 型・件数・文字列長・数値の非負整数性・**明細金額の合計と総額の一致**まで確認し、
+   * 一つでも崩れていれば `PayloadValidationError` を投げて呼び出し側でエラー表示に落とす
+   * (以前は型不一致があると `row[0]` 等へのアクセスで例外を投げっぱなしにし、
+   * 「読み込んでいます…」のまま止まっていた)。
+   */
   function normalizePayload(raw) {
-    if (!raw || typeof raw !== "object") return null;
-    if (typeof raw.n !== "string" || !raw.n) return null;
-    if (typeof raw.t !== "number") return null;
-    if (!Array.isArray(raw.i) || raw.i.length === 0) return null;
-    const issuer = raw.is && typeof raw.is === "object" ? raw.is : {};
+    if (!isPlainObject(raw)) throw new PayloadValidationError("type-mismatch");
+
+    const no = requireString(raw.n, false);
+    if (!isNonNegativeInteger(raw.t)) throw new PayloadValidationError("type-mismatch");
+    if (!Array.isArray(raw.i) || raw.i.length === 0) throw new PayloadValidationError("type-mismatch");
+    if (raw.i.length > PAYLOAD_LIMITS.maxItems) throw new PayloadValidationError("too-large");
+
+    const items = raw.i.map((row) => {
+      if (!Array.isArray(row) || row.length < 3) throw new PayloadValidationError("type-mismatch");
+      const name = requireString(row[0], true);
+      const amount = row[1];
+      const qty = row[2];
+      const taxRate = row.length > 3 ? row[3] : null;
+      if (!isNonNegativeInteger(amount)) throw new PayloadValidationError("type-mismatch");
+      if (!isNonNegativeInteger(qty)) throw new PayloadValidationError("type-mismatch");
+      if (taxRate !== null && !isFiniteInteger(taxRate)) throw new PayloadValidationError("type-mismatch");
+      return { name, amount, qty, taxRate };
+    });
+
+    // v8-9: 明細金額の合計と総額が一致しない=改ざん・破損とみなす
+    const itemsSum = items.reduce((sum, it) => sum + it.amount, 0);
+    if (itemsSum !== raw.t) throw new PayloadValidationError("sum-mismatch");
+
+    let tax = [];
+    if (raw.x !== undefined) {
+      if (!Array.isArray(raw.x)) throw new PayloadValidationError("type-mismatch");
+      if (raw.x.length > PAYLOAD_LIMITS.maxItems) throw new PayloadValidationError("too-large");
+      tax = raw.x.map((row) => {
+        if (!Array.isArray(row) || row.length < 3) throw new PayloadValidationError("type-mismatch");
+        const [rate, target, taxAmount] = row;
+        if (!isNonNegativeInteger(rate) || !isNonNegativeInteger(target) || !isNonNegativeInteger(taxAmount)) {
+          throw new PayloadValidationError("type-mismatch");
+        }
+        return { rate, target, tax: taxAmount };
+      });
+    }
+
+    if (raw.is !== undefined && !isPlainObject(raw.is)) throw new PayloadValidationError("type-mismatch");
+    const issuer = raw.is || {};
+
     return {
-      no: raw.n,
-      dateRaw: typeof raw.d === "string" ? raw.d : "",
-      payee: typeof raw.p === "string" ? raw.p : "",
+      no,
+      dateRaw: optionalString(raw.d),
+      payee: optionalString(raw.p),
       total: raw.t,
-      items: raw.i.map((row) => ({
-        name: String(row[0] ?? ""),
-        amount: Number(row[1]) || 0,
-        qty: Number(row[2]) || 0,
-        taxRate: row[3] == null ? null : Number(row[3])
-      })),
-      tax: Array.isArray(raw.x)
-        ? raw.x.map((row) => ({ rate: Number(row[0]), target: Number(row[1]), tax: Number(row[2]) }))
-        : [],
+      items,
+      tax,
       issuer: {
-        name: typeof issuer.n === "string" ? issuer.n : "",
-        address: typeof issuer.a === "string" ? issuer.a : "",
-        personName: typeof issuer.p === "string" ? issuer.p : "",
-        registrationNumber: typeof issuer.r === "string" ? issuer.r : ""
+        name: optionalString(issuer.n),
+        address: optionalString(issuer.a),
+        personName: optionalString(issuer.p),
+        registrationNumber: optionalString(issuer.r)
       }
     };
   }
@@ -643,20 +722,25 @@
       return;
     }
 
-    let raw;
+    // v8-9: フラグメントは客のURL由来で改変できる不信な入力。デコードも正規化(型・件数・
+    // 文字列長・合計の整合性)も同じ try の内側で行い、どこで転んでも例外を投げっぱなしにせず
+    // エラー表示へ落とす(以前は normalizePayload が try の外にあり、型不一致があると
+    // 例外が拾われず「読み込んでいます…」のまま止まっていた)。
+    let doc;
     try {
-      raw = await decodeFragment(fragment);
+      const raw = await decodeFragment(fragment);
+      doc = normalizePayload(raw);
     } catch (e) {
-      showError(
-        "領収書のデータが読み取れません",
-        "このブラウザは圧縮データの展開に対応していません。別のブラウザ(Chrome / Safari 最新版)でお試しください。"
-      );
-      return;
-    }
-
-    const doc = normalizePayload(raw);
-    if (!doc) {
-      showError("領収書のデータが読み取れません", "発行元からもう一度QRコードを見せてもらってください。");
+      if (e instanceof PayloadValidationError && e.reason === "sum-mismatch") {
+        showError("領収書のデータが壊れています", "発行元からもう一度QRコードを見せてもらってください。");
+      } else if (e instanceof PayloadValidationError) {
+        showError("領収書のデータが読み取れません", "発行元からもう一度QRコードを見せてもらってください。");
+      } else {
+        showError(
+          "領収書のデータが読み取れません",
+          "このブラウザは圧縮データの展開に対応していません。別のブラウザ(Chrome / Safari 最新版)でお試しください。"
+        );
+      }
       return;
     }
 
